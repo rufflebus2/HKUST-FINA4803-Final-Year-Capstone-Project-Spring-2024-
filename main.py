@@ -1,16 +1,12 @@
 #region imports
 from AlgorithmImports import *
+from PairObjects import *
+from SymbolDataFile import *
 from arch.unitroot.cointegration import engle_granger
 from pykalman import KalmanFilter
 from itertools import combinations
-from PairObjects import *
-from SymbolDataFile import *
 from datetime import *
-from scipy.optimize import minimize
-from statsmodels.tsa.vector_ar.vecm import VECM
 from statsmodels.tsa.vector_ar.vecm import coint_johansen
-from sklearn.preprocessing import MinMaxScaler
-import statsmodels.api as sm
 #endregion
 
 class PCADemo(QCAlgorithm):
@@ -39,15 +35,15 @@ class PCADemo(QCAlgorithm):
         # For different modes
         self.equal_hedge = False # If False, then run cointegration test for Hedge ratio
         self.optimization = True # Must be False if equal_hedge is True
-        self.includeSLTP = False
-        self.volAdj = False
+        self.includeSLTP = True
+        self.volAdj = True
         if self.equal_hedge:
             self.optimization = False
         
-        self.maxPairs = 5
-        self.maxDrawdown = 0.05
+        self.maxPairs = 10
+        self.maxDrawdown = 0.1
         self.takeProfit = 0.2
-        self.sdThresh = 1.01 / 100
+        self.sdThresh = 1.5 / 100
 
         self.pair_list = [] # List of all 45 pairs
         self.symbol_data = {} # Symbol data of 45 pairs
@@ -56,8 +52,8 @@ class PCADemo(QCAlgorithm):
         self.coint_time = datetime.min
         self.kalman_time = datetime.min
         self.liq_time = datetime.min
-        self.coint_interval = timedelta(days = 7) # Cointegration test every 7 days
-        self.kalman_interval = timedelta(days = 7) # Run Kalman filter every day
+        self.coint_interval = timedelta(days = 7) # Run Cointegration test every 7 days
+        self.kalman_interval = timedelta(days = 1) # Run Kalman filter every day
         self.liq_interval = timedelta(days = 1) # Check potential liquidation pairs every day
         self.kalman_data = 14 # days
         self.coint_data = 50 # days
@@ -67,9 +63,6 @@ class PCADemo(QCAlgorithm):
         self.position_list = [] 
         self.numPairsInTrade = 0 # Number of pairs to trade (not necessarily in position)
         self.numPairsInPosition = 0 # Number of pairs in position
-        # self.coin_percentage = {} 
-        # for coin in self.assets:
-        #     self.coin_percentage[coin] = [0]
         
         for coin in self.assets:
             symbol = self.AddCrypto(
@@ -89,14 +82,10 @@ class PCADemo(QCAlgorithm):
     ########## Main functions ###########
 
     def OnData(self, data):
-        # for symbol, symbolData in self.symbol_data.items():
-        #     if data.Bars.ContainsKey(symbol):
-        #         symbolData.Update(data.Bars[symbol])
         cur_time = self.Time
         time_format = '%Y-%m-%d %H:%M:%S'
         self.time_string = cur_time.strftime(time_format)
 
-        #self.Debug(f'--------------------------- {time_string} ---------------------------')
         if self.Time >= self.liq_time:
             self.liq_time = self.Time + self.liq_interval
             self.LiquidateCheck()
@@ -152,10 +141,6 @@ class PCADemo(QCAlgorithm):
             self.Debug(f'Added {pair.a.symbol} and {pair.b.symbol} ({self.time_string})')
         
         self.numPairsInTrade += len(pass_list)
-        # self.Debug(f'{self.numPairsInTrade} current trading pairs for strategy: ')
-        # for pair in self.pair_list:
-        #     if pair.trading_pair:
-        #         self.Debug(f'{pair.a.symbol} and {pair.b.symbol}')
 
     def RunKalman(self): # Not actually the filter
         for pair in self.pair_list:
@@ -183,42 +168,34 @@ class PCADemo(QCAlgorithm):
         # Will use last hour data to check whether to enter or exit
         log_price = log_price[-self.kalman_data * 24:-1]
         
-        # Get the weighted spread across different cointegration subspaces
+        # Get the spread across different cointegration subspaces
         if self.equal_hedge and not self.optimization: # Use 50/50 hedge ratio
             spread, beta = self.GetSpreads(log_price)
             used_spread = spread
         elif not self.equal_hedge and self.optimization: # Use cointegration for hedge ratio and optimize
-            weighted_spread, weights, beta = self.GetSpreads(log_price) # ORIGINAL IS HERE
+            weighted_spread, weights, beta = self.GetSpreads(log_price) 
             used_spread = weighted_spread
-        elif not self.equal_hedge and not self.optimization:
+        elif not self.equal_hedge and not self.optimization: # Use cointegration for hedge ratio, do not optimize
             spread, beta = self.GetSpreads(log_price)
             used_spread = spread
         
         # Set up the Kalman Filter with the weighted spread series, and obtain the adjusted mean series
-        # mean_series = self.SetKalmanFilter(weighted_spread, pair) # ORIGINAL IS HERE
-        # mean_series = self.SetKalmanFilter1(spread, pair) # ORIGINAL IS HERE
         mean_series = self.SetKalmanFilter(used_spread, pair)
 
         # Obtain the normalized spread series, the first 20 in-sample will be discarded.
-        # normalized_spread = (weighted_spread.iloc[20:] - mean_series) # ORIGINAL IS HERE
         normalized_spread = (used_spread.iloc[20:] - mean_series)
 
         # Set the threshold of price divergence to optimize profit
         self.SetTradingThreshold(normalized_spread, pair)
 
         # Set the normalize trading weight/Hedge ratio
-        # weights = self.GetTradingWeight(beta, weights) # ORIGINAL IS HERE
         if not self.optimization:
             weights = beta / np.sum(abs(beta))
         else:
             weights = self.GetTradingWeight(beta, weights)
 
-        # if (weights[0] > 0 and weights[1] > 0) or (weights[0] < 0 and weights[1] < 0):
-        #     self.Error('Weights are the same sign')
-
         # If pair is in position already, no need to change hedge ratio
         if pair.state == 0:
-            # pair.trading_weight = np.abs(weights) # ORIGINAL IS np.abs(weights)
             pair.trading_weight[0] = np.abs(weights[0])
             pair.trading_weight[1] = -np.abs(weights[1])
             print(1)
@@ -330,8 +307,6 @@ class PCADemo(QCAlgorithm):
             ticket_a = self.MarketOrder(pair.a.symbol.Value, -pair.qty_a)
             ticket_b = self.MarketOrder(pair.b.symbol.Value, -pair.qty_b)
             self.numPairsInPosition -= 1
-            #self.coin_percentage[pair.a.symbol.Value].append(-pair.state * pair.trading_weight[0])
-            #self.coin_percentage[pair.b.symbol.Value].append(pair.state * pair.trading_weight[1])
             self.Debug(f'Exit Position: {pair.qty_a} {pair.a.symbol} @ ${ticket_a.AverageFillPrice} and {pair.qty_b} {pair.b.symbol} @ ${ticket_b.AverageFillPrice} ({self.time_string})')
         pair.resetParams(self)
         if trade:
@@ -343,58 +318,19 @@ class PCADemo(QCAlgorithm):
     ########## KALMAN STUFF BELOW (used in kfilter function) ###########
 
     def GetSpreads(self, logPriceDf):
-        # Initialize a VECM model following the unit test parameters, then fit to our data.
-        
-        ####### USING VECM (SVD DOES NOT CONVERGE) #########
-        # # We allow 3 AR difference, and no deterministic term.
-        # vecm_result = VECM(logPriceDf, k_ar_diff=3, coint_rank=1, deterministic='n').fit()
-        # # Obtain the Beta attribute. This is the cointegration subspaces' unit vectors.
-        # beta = vecm_result.beta
-        # # get the spread of different cointegration subspaces.
-        # spread = logPriceDf @ beta
-
-        ####### USING JOHANSEN COINT (SVD DOES NOT CONVERGE) #########
-        # # Perform Johansen Cointegration test
-        # result = coint_johansen(logPriceDf, det_order=0, k_ar_diff=3)
-        # # Obtain the cointegration vectors
-        # beta = result.evec[:, 0]  # Assuming you want the first cointegration vector
-        # beta = beta.reshape(2,1)
-        # # Calculate the spread
-        # spread = logPriceDf @ beta
-
-        ####### USING ENGLE-GRANGER COINTEGRATION TEST #########
         coint_result = engle_granger(logPriceDf.iloc[:, 0], logPriceDf.iloc[:, 1], trend="c", lags=0)
         beta = coint_result.cointegrating_vector[:2] # without optimization
         if self.equal_hedge:
             beta = np.array([1, -1]) # equal hedge
         if self.optimization:
-            beta = np.array(beta).reshape(2,1) # with optimization
+            beta = np.array(beta).reshape(2,1) # Optimization needs specific shape
 
-        # # Step 5: Specify the dependent and independent variables
-        # y = logPriceDf[logPriceDf.columns[0]]
-        # X = logPriceDf[logPriceDf.columns[1]]
-        # # Adjust the variable names as needed
-
-        # # Step 6: Add a constant term
-        # X = sm.add_constant(X)
-
-        # # Step 7: Fit the ARDL model
-        # model = sm.OLS(y, X)
-        # results = model.fit()
-
-        # # Step 8: Get the beta (cointegration vectors)
-        # beta = results.params[1:]  # Exclude the constant term
-
-        spread = logPriceDf @ beta # (1000,2) * (2,1)
+        spread = logPriceDf @ beta 
 
         if self.optimization:
             return self.OptimizeSpreads(spread, beta)
         else:
             return spread, beta
-
-        # Optimize the distribution across cointegration subspaces and return the weighted spread
-        # return self.OptimizeSpreads(spread, beta) # OGIRINAL IS HERE
-        # return spread, beta
 
     def OptimizeSpreads(self, spread, beta):
         # We set the weight on each vector is between -1 and 1. While overall sum is 0.
@@ -420,7 +356,6 @@ class PCADemo(QCAlgorithm):
         return spread @ opt.x, opt.x, beta
 
     def SetKalmanFilter(self, weighted_spread, pair):
-        #self.Debug('set kalman')
         # Initialize a Kalman Filter. Using the first 20 data points to optimize its initial state. 
         # We assume the market has no regime change so that the transitional matrix and observation matrix is [1].
         pair.kalmanFilter = KalmanFilter(transition_matrices = [1],
@@ -495,14 +430,8 @@ class PCADemo(QCAlgorithm):
 
         init_value = -(order_priceA * qA + order_priceB * qB) 
         cur_value = cur_priceA * qA + cur_priceB * qB
-        #init_value = -(pair.state * order_priceA * qA - pair.state * order_priceB * qB)
-        #cur_value =  (pair.state * cur_priceA * qA - pair.state * cur_priceB * qB)
         profit = init_value + cur_value
         profitPerc = profit / np.abs(init_value)
-        # self.Debug(f'Initial value: {init_value}')
-        # self.Debug(f'Current value: {cur_value}')
-        # self.Debug(f'Profit: {profit}')
-        # self.Debug(f'Profit %: {profitPerc}')
 
         if profitPerc < -self.maxDrawdown:
             sl = True
@@ -528,16 +457,6 @@ class PCADemo(QCAlgorithm):
 
         retA.dropna(inplace=True)
         retB.dropna(inplace=True)
-
-        # historyA = historyA.values.reshape(-1, 1)
-        # historyB = historyB.values.reshape(-1, 1)
-
-        # scaler = MinMaxScaler()
-        # historyA = scaler.fit_transform(historyA)
-        # historyB = scaler.fit_transform(historyB)
-
-        # std_a = np.std(historyA)
-        # std_b = np.std(historyB)
 
         std_a = retA.std()
         std_b = retB.std()
